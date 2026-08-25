@@ -24,9 +24,25 @@ the +Z direction. Useful controls include `--height`, `--voxel-size`,
 `--poisson-depth`, `--target-triangles`, `--atlas-size`, and `--min-points`.
 Progress messages are enabled by default; pass `--quiet` when an orchestrating
 `main.py` should suppress them.
-Texel projection, bilinear image sampling, and multi-view blending use CUDA by
-default. Use `--views-per-face` to change the blend count or `--device cpu` to
-disable CUDA.
+
+Texture modes:
+
+- `--texture-source point_rgb` (default): builds cylindrical atlases directly
+	from the RGB values stored in `segmented.laz`. This is faster and currently
+	produces more stable bark atlases.
+- `--texture-source camera`: projects textures from COLMAP images using
+	fisheye camera models and GPU blending.
+
+Point-RGB mode knobs:
+
+- `--trunk-slice-height`, `--trunk-radius-quantile`, `--trunk-radius-scale`:
+	suppress branches/foliage before meshing and texturing.
+- `--inpaint-radius-px`: fills empty atlas texels from nearby observed texels.
+	The atlas mask still marks originally observed texels.
+
+Camera mode knobs:
+
+- `--views-per-face` and `--device` (CUDA by default).
 
 Outputs are written under the selected output directory:
 

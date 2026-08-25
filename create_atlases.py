@@ -1,8 +1,11 @@
-"""Create decimated, textured trunk meshes from a TreeLearn-labeled cloud.
+"""Create cylinder-based trunk atlases from a TreeLearn-labeled cloud.
 
-The script intentionally processes one tree at a time. This keeps peak memory
-reasonable for the multi-million-point dense cloud and makes a small pilot
-possible with ``--max-trees`` before processing the whole scene.
+Pipeline summary:
+1. Select trunk points per tree (height crop + radial branch suppression).
+2. Fit a tilted cylinder to each tree.
+3. Build an analytic cylinder mesh (no Poisson reconstruction).
+4. Project source images onto tree points and blend per-point color.
+5. Rasterize blended points into a rectangular cylinder atlas.
 """
 
 from __future__ import annotations
@@ -17,12 +20,10 @@ from typing import Callable
 
 import laspy
 import numpy as np
-import open3d as o3d
 import pycolmap
-import torch
-import torch.nn.functional as F
 import trimesh
 from PIL import Image
+from scipy.spatial import cKDTree
 
 
 @dataclass
@@ -31,7 +32,28 @@ class Camera:
     path: Path
     width: int
     height: int
+    center: np.ndarray
     colmap_image: object
+    camera_model: object
+    cam_from_world: np.ndarray
+
+
+@dataclass
+class TreeData:
+    points: np.ndarray
+    colors16: np.ndarray | None
+
+
+@dataclass
+class CylinderModel:
+    center: np.ndarray
+    axis: np.ndarray
+    radius: float
+    t_min: float
+    t_max: float
+    e1: np.ndarray
+    e2: np.ndarray
+    seam_offset: float
 
 
 def make_logger(quiet: bool) -> Callable[[str], None]:
@@ -44,25 +66,128 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("colmap_model", type=Path)
     parser.add_argument("images", type=Path)
     parser.add_argument("output", type=Path)
+
     parser.add_argument("--height", type=float, default=5.0,
                         help="Height in world units retained above each tree base (default: 5 m).")
     parser.add_argument("--vertical-axis", type=int, choices=(0, 1, 2), default=2)
-    parser.add_argument("--voxel-size", type=float, default=0.03,
-                        help="Point-cloud voxel size before reconstruction (default: 0.03).")
-    parser.add_argument("--poisson-depth", type=int, default=9)
-    parser.add_argument("--target-triangles", type=int, default=12000)
-    parser.add_argument("--atlas-size", type=int, default=2048)
     parser.add_argument("--min-points", type=int, default=500)
     parser.add_argument("--max-trees", type=int)
-    parser.add_argument("--depth-tolerance", type=float, default=0.03,
-                        help="Extra world-distance tolerance for ray visibility checks.")
-    parser.add_argument("--views-per-face", type=int, default=6,
-                        help="Maximum source views blended for each face (default: 6).")
-    parser.add_argument("--device", default="cuda",
-                        help="Torch device for texel projection and image sampling (default: cuda).")
-    parser.add_argument("--quiet", action="store_true",
-                        help="Suppress progress output; errors and the manifest are still produced.")
+
+    parser.add_argument("--trunk-slice-height", type=float, default=0.25,
+                        help="Vertical slice height for trunk radial filtering (default: 0.25 m).")
+    parser.add_argument("--trunk-radius-quantile", type=float, default=0.7,
+                        help="Radial quantile kept per slice to suppress branches (default: 0.7).")
+    parser.add_argument("--trunk-radius-scale", type=float, default=1.2,
+                        help="Multiplier on per-slice radial threshold (default: 1.2).")
+
+    parser.add_argument("--atlas-size", type=int, default=1024)
+    parser.add_argument("--inpaint-radius-px", type=int, default=18,
+                        help="kNN inpainting radius in atlas pixels (default: 18).")
+
+    parser.add_argument("--max-texture-points", type=int, default=70000,
+                        help="Maximum points per tree used for camera texture projection.")
+    parser.add_argument("--max-cameras-per-tree", type=int, default=24,
+                        help="Nearest cameras tested for each tree.")
+    parser.add_argument("--max-views-per-point", type=int, default=3,
+                        help="Maximum blended camera observations per point.")
+    parser.add_argument("--min-normal-dot", type=float, default=0.1,
+                        help="Reject camera samples if view angle is too grazing.")
+    parser.add_argument(
+        "--texture-source",
+        choices=("camera_cylinder", "camera_points", "point_rgb"),
+        default="camera_cylinder",
+        help=(
+            "Texture source: project analytic cylinder texels from cameras, "
+            "project observed point samples from cameras, or use LAS point RGB."
+        ),
+    )
+
+    parser.add_argument("--cylinder-sides", type=int, default=96)
+    parser.add_argument("--cylinder-rings", type=int, default=48)
+
+    parser.add_argument("--quiet", action="store_true")
     return parser.parse_args()
+
+
+def filter_trunk_points(points: np.ndarray, axis: int, slice_height: float,
+                        radius_quantile: float, radius_scale: float) -> tuple[np.ndarray, np.ndarray]:
+    if len(points) == 0:
+        return points, np.zeros(0, dtype=bool)
+    other = [index for index in range(3) if index != axis]
+    z = points[:, axis]
+    z_min, z_max = float(z.min()), float(z.max())
+    if z_max - z_min < 1e-6:
+        return points, np.ones(len(points), dtype=bool)
+
+    bins = max(2, int(np.ceil((z_max - z_min) / max(slice_height, 1e-3))))
+    edges = np.linspace(z_min, z_max, bins + 1)
+    keep = np.zeros(len(points), dtype=bool)
+    global_center = np.median(points[:, other], axis=0)
+
+    for bin_index in range(bins):
+        in_bin = (z >= edges[bin_index]) & (z <= edges[bin_index + 1] if bin_index == bins - 1 else z < edges[bin_index + 1])
+        if not np.any(in_bin):
+            continue
+        slice_points = points[in_bin][:, other]
+        center = np.median(slice_points, axis=0) if len(slice_points) >= 10 else global_center
+        radii = np.linalg.norm(slice_points - center[None, :], axis=1)
+        threshold = np.quantile(radii, np.clip(radius_quantile, 0.1, 0.98)) * max(radius_scale, 0.5)
+        keep[in_bin] = radii <= threshold
+
+    if keep.mean() < 0.2:
+        keep[:] = True
+    return points[keep], keep
+
+
+def load_tree_points(path: Path, axis: int, height: float,
+                     min_points: int, log: Callable[[str], None],
+                     trunk_slice_height: float,
+                     trunk_radius_quantile: float,
+                     trunk_radius_scale: float) -> dict[int, TreeData]:
+    log(f"Loading segmented point cloud: {path}")
+    cloud = laspy.read(path)
+    if "treeID" not in cloud.point_format.extra_dimension_names:
+        raise ValueError("The segmented cloud has no treeID extra dimension")
+
+    coordinates = np.column_stack((cloud.x, cloud.y, cloud.z)).astype(np.float32)
+    has_rgb = all(name in cloud.point_format.dimension_names for name in ("red", "green", "blue"))
+    colors16 = (
+        np.column_stack((cloud.red, cloud.green, cloud.blue)).astype(np.float32)
+        if has_rgb else None
+    )
+    labels = np.asarray(cloud["treeID"])
+    label_ids = np.unique(labels)
+    log(f"  Read {len(labels):,} points with {len(label_ids[label_ids > 0])} positive tree labels")
+
+    trees: dict[int, TreeData] = {}
+    discarded = 0
+    retained_after_filter = 0
+
+    for tree_id in label_ids:
+        tree_id = int(tree_id)
+        if tree_id <= 0:
+            continue
+        selected = labels == tree_id
+        points = coordinates[selected]
+        point_colors = colors16[selected] if colors16 is not None else None
+        base = float(points[:, axis].min())
+        trunk_mask = points[:, axis] <= base + height
+        points = points[trunk_mask]
+        if point_colors is not None:
+            point_colors = point_colors[trunk_mask]
+        points, keep = filter_trunk_points(
+            points, axis, trunk_slice_height, trunk_radius_quantile, trunk_radius_scale)
+        if point_colors is not None:
+            point_colors = point_colors[keep]
+        retained_after_filter += len(points)
+        if len(points) >= min_points:
+            trees[tree_id] = TreeData(points=points, colors16=point_colors)
+        else:
+            discarded += 1
+
+    log(f"  Retained {len(trees)} trees after +{height:g} vertical crop; discarded {discarded} small trees")
+    log(f"  Trunk filter kept {retained_after_filter:,} points across retained trees")
+    return trees
 
 
 def load_cameras(model_path: Path, image_root: Path,
@@ -80,289 +205,475 @@ def load_cameras(model_path: Path, image_root: Path,
                 width, height = image.size
         except (OSError, ValueError):
             continue
-        cameras.append(Camera(colmap_image.name, path, width, height, colmap_image))
+        pose = np.asarray(colmap_image.cam_from_world().matrix(), dtype=np.float64)
+        center = np.asarray(colmap_image.projection_center(), dtype=np.float32)
+        camera_model = colmap_image.camera
+        if camera_model is None:
+            continue
+        cameras.append(
+            Camera(
+                name=colmap_image.name,
+                path=path,
+                width=width,
+                height=height,
+                center=center,
+                colmap_image=colmap_image,
+                camera_model=camera_model,
+                cam_from_world=pose,
+            )
+        )
     if not cameras:
         raise RuntimeError("No posed COLMAP images could be opened")
     log(f"  Loaded {len(cameras)} posed source images from {image_root}")
     return cameras
 
 
-def load_tree_points(path: Path, axis: int, height: float,
-                     min_points: int, log: Callable[[str], None]) -> dict[int, np.ndarray]:
-    log(f"Loading segmented point cloud: {path}")
-    cloud = laspy.read(path)
-    if "treeID" not in cloud.point_format.extra_dimension_names:
-        raise ValueError("The segmented cloud has no treeID extra dimension")
-    coordinates = np.column_stack((cloud.x, cloud.y, cloud.z)).astype(np.float32)
-    labels = np.asarray(cloud["treeID"])
-    label_ids = np.unique(labels)
-    log(f"  Read {len(labels):,} points with {len(label_ids[label_ids > 0])} positive tree labels")
-    trees: dict[int, np.ndarray] = {}
-    discarded = 0
-    for tree_id in label_ids:
-        tree_id = int(tree_id)
-        if tree_id <= 0:
-            continue
-        points = coordinates[labels == tree_id]
-        base = float(points[:, axis].min())
-        points = points[points[:, axis] <= base + height]
-        if len(points) >= min_points:
-            trees[tree_id] = points
-        else:
-            discarded += 1
-    log(f"  Retained {len(trees)} trees after +{height:g} vertical crop; discarded {discarded} small trees")
-    return trees
+def orthonormal_basis_from_axis(axis: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    helper = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    if abs(float(np.dot(axis, helper))) > 0.9:
+        helper = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    e1 = np.cross(axis, helper)
+    e1 /= np.linalg.norm(e1) + 1e-8
+    e2 = np.cross(axis, e1)
+    e2 /= np.linalg.norm(e2) + 1e-8
+    return e1.astype(np.float32), e2.astype(np.float32)
 
 
-def build_mesh(points: np.ndarray, voxel_size: float, poisson_depth: int,
-               target_triangles: int) -> tuple[np.ndarray, np.ndarray]:
-    cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
-    if voxel_size > 0:
-        cloud = cloud.voxel_down_sample(voxel_size)
-    if len(cloud.points) < 30:
-        raise ValueError("too few points after voxel downsampling")
-    radius = max(voxel_size * 3.0, 0.05)
-    cloud.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=30))
-    cloud.orient_normals_consistent_tangent_plane(min(30, len(cloud.points) - 1))
-    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-        cloud, depth=poisson_depth, scale=1.1, linear_fit=True)
-    density = np.asarray(densities)
-    if len(density):
-        mesh.remove_vertices_by_mask(density < np.quantile(density, 0.02))
-    mesh.remove_degenerate_triangles()
-    mesh.remove_duplicated_triangles()
-    mesh.remove_non_manifold_edges()
-    if target_triangles > 0 and len(mesh.triangles) > target_triangles:
-        mesh = mesh.simplify_quadric_decimation(target_triangles)
-    mesh.remove_unreferenced_vertices()
-    vertices = np.asarray(mesh.vertices).astype(np.float32)
-    faces = np.asarray(mesh.triangles).astype(np.int32)
-    if len(vertices) == 0 or len(faces) == 0:
-        raise ValueError("surface reconstruction produced an empty mesh")
-    return vertices, faces
+def align_seam_offset(angles: np.ndarray, bins: int = 180) -> float:
+    u = (angles / (2.0 * np.pi) + 0.5) % 1.0
+    hist, edges = np.histogram(u, bins=bins, range=(0.0, 1.0))
+    seam_bin = int(np.argmin(hist))
+    return float(0.5 * (edges[seam_bin] + edges[seam_bin + 1]))
 
 
-def cylindrical_uv(vertices: np.ndarray, axis: int) -> np.ndarray:
-    other = [index for index in range(3) if index != axis]
-    # Unwrap around this tree's own vertical axis, not the scene origin.
-    horizontal_center = np.median(vertices[:, other], axis=0)
-    centered = vertices[:, other] - horizontal_center
-    angle = np.arctan2(centered[:, 1], centered[:, 0])
-    u = (angle / (2.0 * np.pi) + 0.5) % 1.0
-    low, high = vertices[:, axis].min(), vertices[:, axis].max()
-    v = (vertices[:, axis] - low) / max(high - low, 1e-6)
-    return np.column_stack((u, v)).astype(np.float32)
+def fit_cylinder(points: np.ndarray, vertical_axis: int = 2) -> CylinderModel:
+    center = points.mean(axis=0)
+    shifted = points - center[None, :]
+    _, _, vh = np.linalg.svd(shifted, full_matrices=False)
+    axis = vh[0].astype(np.float32)
+    axis /= np.linalg.norm(axis) + 1e-8
+    # PCA axis sign is arbitrary. Keep all atlases oriented toward +vertical.
+    if axis[vertical_axis] < 0:
+        axis = -axis
 
+    t = shifted @ axis
+    proj = center[None, :] + t[:, None] * axis[None, :]
+    radial = points - proj
+    radius = float(np.median(np.linalg.norm(radial, axis=1)))
 
-def unwrap_face_u(face_uv: np.ndarray) -> np.ndarray:
-    """Choose equivalent U coordinates with the smallest triangle span."""
-    candidates = []
-    for first_shift in (-1, 0, 1):
-        for second_shift in (-1, 0, 1):
-            for third_shift in (-1, 0, 1):
-                shifts = np.array([first_shift, second_shift, third_shift], dtype=np.float32)
-                values = face_uv[:, 0] + shifts
-                candidates.append((float(values.max() - values.min()), values))
-    _, best_u = min(candidates, key=lambda item: item[0])
-    result = face_uv.copy()
-    result[:, 0] = best_u
-    return result
+    e1, e2 = orthonormal_basis_from_axis(axis)
+    x = radial @ e1
+    y = radial @ e2
+    angles = np.arctan2(y, x)
+    seam_offset = align_seam_offset(angles)
 
-
-def camera_projection(camera: Camera, point: np.ndarray) -> tuple[np.ndarray, float, np.ndarray] | None:
-    projection = camera.colmap_image.project_point(point.astype(float))
-    if projection is None:
-        return None
-    pose = camera.colmap_image.cam_from_world().matrix()
-    camera_point = pose[:, :3] @ point + pose[:, 3]
-    if camera_point[2] <= 0:
-        return None
-    return np.asarray(projection, dtype=np.float64), float(camera_point[2]), camera_point
-
-
-def choose_camera(cameras: list[Camera], point: np.ndarray, scene: o3d.t.geometry.RaycastingScene,
-                  depth_tolerance: float) -> tuple[Camera, np.ndarray] | None:
-    best: tuple[float, Camera, np.ndarray] | None = None
-    for camera in cameras:
-        result = camera_projection(camera, point)
-        if result is None:
-            continue
-        pixel, depth, camera_point = result
-        width, height = camera.width, camera.height
-        if not (0 <= pixel[0] < width and 0 <= pixel[1] < height):
-            continue
-        pose = camera.colmap_image.cam_from_world().matrix()
-        camera_center = -pose[:, :3].T @ pose[:, 3]
-        direction = point - camera_center
-        distance = float(np.linalg.norm(direction))
-        if distance <= 0:
-            continue
-        ray = np.concatenate((camera_center, direction / distance)).astype(np.float32)
-        hit = scene.cast_rays(o3d.core.Tensor(ray[None, :]))["t_hit"].numpy()[0]
-        if not np.isfinite(hit) or float(hit) > distance + depth_tolerance:
-            continue
-        # Prefer close, front-facing observations while avoiding extreme views.
-        score = depth
-        if best is None or score < best[0]:
-            best = (score, camera, pixel)
-    return None if best is None else (best[1], best[2])
-
-
-def _camera_tensors(cameras: list[Camera], device: torch.device) -> tuple[torch.Tensor, ...]:
-    poses = []
-    intrinsics = []
-    for camera in cameras:
-        poses.append(camera.colmap_image.cam_from_world().matrix())
-        params = np.asarray(camera.colmap_image.camera.params, dtype=np.float32)
-        if camera.colmap_image.camera.model_name != "OPENCV_FISHEYE":
-            raise ValueError(f"Unsupported COLMAP camera model: {camera.colmap_image.camera.model_name}")
-        intrinsics.append(params)
-    return (
-        torch.as_tensor(np.asarray(poses), dtype=torch.float32, device=device),
-        torch.as_tensor(np.asarray(intrinsics), dtype=torch.float32, device=device),
+    return CylinderModel(
+        center=center.astype(np.float32),
+        axis=axis,
+        radius=max(radius, 1e-3),
+        t_min=float(t.min()),
+        t_max=float(t.max()),
+        e1=e1,
+        e2=e2,
+        seam_offset=seam_offset,
     )
 
 
-def _project_fisheye(points: torch.Tensor, poses: torch.Tensor,
-                     intrinsics: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Project points into all cameras; output shapes are (cameras, points)."""
-    camera_points = torch.einsum("cij,pj->cpi", poses[:, :, :3], points) + poses[:, :, 3][:, None, :]
-    depth = camera_points[:, :, 2]
-    normalized = camera_points[:, :, :2] / depth.clamp_min(1e-6)[..., None]
-    radius = torch.linalg.vector_norm(normalized, dim=-1)
-    theta = torch.atan(radius)
-    theta2 = theta * theta
-    distortion = (1 + intrinsics[:, 4, None] * theta2
-                  + intrinsics[:, 5, None] * theta2 * theta2
-                  + intrinsics[:, 6, None] * theta2 * theta2 * theta2
-                  + intrinsics[:, 7, None] * theta2 * theta2 * theta2 * theta2)
-    scale = torch.where(radius > 1e-8, theta * distortion / radius, torch.ones_like(radius))
-    distorted = normalized * scale[..., None]
-    pixels = distorted * intrinsics[:, None, :2] + intrinsics[:, None, 2:4]
-    return pixels, depth
+def points_to_cylinder_uv(points: np.ndarray, model: CylinderModel) -> tuple[np.ndarray, np.ndarray]:
+    shifted = points - model.center[None, :]
+    t = shifted @ model.axis
+    radial = shifted - t[:, None] * model.axis[None, :]
+    x = radial @ model.e1
+    y = radial @ model.e2
+    angle = np.arctan2(y, x)
+    u = (angle / (2.0 * np.pi) + 0.5 - model.seam_offset) % 1.0
+    v = (t - model.t_min) / max(model.t_max - model.t_min, 1e-6)
+    return np.column_stack((u, v)).astype(np.float32), radial
 
 
-def _face_candidates(center: torch.Tensor, cameras: list[Camera], poses: torch.Tensor,
-                     intrinsics: torch.Tensor, views_per_face: int) -> torch.Tensor:
-    pixels, depth = _project_fisheye(center[None, :], poses, intrinsics)
-    pixels, depth = pixels[:, 0], depth[:, 0]
-    bounds = torch.tensor([[camera.width, camera.height] for camera in cameras],
-                          dtype=torch.float32, device=center.device)
-    valid = ((depth > 0) & (pixels[:, 0] >= 0) & (pixels[:, 1] >= 0)
-             & (pixels[:, 0] < bounds[:, 0]) & (pixels[:, 1] < bounds[:, 1]))
-    scores = torch.where(valid, depth, torch.tensor(float("inf"), device=center.device))
-    return torch.argsort(scores)[:views_per_face][torch.isfinite(scores[torch.argsort(scores)[:views_per_face]])]
+def bilinear_sample_many(image: np.ndarray, xy: np.ndarray) -> np.ndarray:
+    """Bilinearly sample an RGB image at N floating-point pixel coordinates."""
+    if len(xy) == 0:
+        return np.empty((0, 3), dtype=np.float32)
+
+    h, w, _ = image.shape
+    x = np.clip(xy[:, 0], 0.0, max(w - 1.001, 0.0))
+    y = np.clip(xy[:, 1], 0.0, max(h - 1.001, 0.0))
+    x0 = np.floor(x).astype(np.int32)
+    y0 = np.floor(y).astype(np.int32)
+    x1 = np.minimum(x0 + 1, w - 1)
+    y1 = np.minimum(y0 + 1, h - 1)
+    wx = (x - x0)[:, None]
+    wy = (y - y0)[:, None]
+
+    c00 = image[y0, x0]
+    c10 = image[y0, x1]
+    c01 = image[y1, x0]
+    c11 = image[y1, x1]
+    return (
+        (1.0 - wx) * (1.0 - wy) * c00
+        + wx * (1.0 - wy) * c10
+        + (1.0 - wx) * wy * c01
+        + wx * wy * c11
+    ).astype(np.float32)
 
 
-def _load_gpu_image(camera: Camera, cache: dict[str, torch.Tensor], device: torch.device) -> torch.Tensor:
-    if camera.name not in cache:
+def project_world_points(camera: Camera, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Project N world points with COLMAP's camera model.
+
+    Returns Nx2 pixel coordinates in the *loaded image's* resolution and a
+    validity mask. The explicit world->camera transform lets pycolmap project
+    all points in one vectorized call instead of calling Image.project_point
+    once per point.
+    """
+    points64 = np.asarray(points, dtype=np.float64)
+    pose = camera.cam_from_world
+    cam_points = points64 @ pose[:, :3].T + pose[:, 3][None, :]
+
+    valid = np.isfinite(cam_points).all(axis=1) & (cam_points[:, 2] > 1e-8)
+    xy = np.full((len(points64), 2), np.nan, dtype=np.float64)
+    if np.any(valid):
+        projected = np.asarray(camera.camera_model.img_from_cam(cam_points[valid]), dtype=np.float64)
+        if projected.ndim == 1:
+            projected = projected[None, :]
+        xy[valid] = projected
+
+    model_width = max(float(camera.camera_model.width), 1.0)
+    model_height = max(float(camera.camera_model.height), 1.0)
+    xy[:, 0] *= camera.width / model_width
+    xy[:, 1] *= camera.height / model_height
+
+    valid &= np.isfinite(xy).all(axis=1)
+    valid &= (
+        (xy[:, 0] >= 0.0)
+        & (xy[:, 1] >= 0.0)
+        & (xy[:, 0] < camera.width - 1)
+        & (xy[:, 1] < camera.height - 1)
+    )
+    return xy, valid
+
+
+def point_rgb_to_uint8(colors: np.ndarray) -> np.ndarray:
+    """Convert LAS RGB to 0..255, supporting both 8-bit-like and 16-bit data."""
+    colors = np.asarray(colors, dtype=np.float32)
+    if colors.size == 0:
+        return colors.reshape(-1, 3)
+    scale = 1.0 if float(np.nanmax(colors)) <= 255.0 else 257.0
+    return np.clip(colors / scale, 0.0, 255.0).astype(np.float32)
+
+
+def inpaint_atlas_periodic(atlas: np.ndarray, observed: np.ndarray,
+                           radius_px: int) -> np.ndarray:
+    """Fill nearby holes while treating the cylinder's left/right seam as periodic."""
+    if radius_px <= 0 or not np.any(observed):
+        return atlas
+
+    size = atlas.shape[1]
+    valid_coords = np.column_stack(np.where(observed))
+    valid_colors = atlas[valid_coords[:, 0], valid_coords[:, 1]].astype(np.float32)
+    empty_coords = np.column_stack(np.where(~observed))
+    if len(empty_coords) == 0:
+        return atlas
+
+    # Duplicate observed samples across the horizontal wrap so pixels near u=0
+    # can be filled from pixels near u=1 and vice versa.
+    left = valid_coords.copy()
+    left[:, 1] -= size
+    right = valid_coords.copy()
+    right[:, 1] += size
+    tiled_coords = np.concatenate((left, valid_coords, right), axis=0)
+    tiled_colors = np.concatenate((valid_colors, valid_colors, valid_colors), axis=0)
+
+    tree = cKDTree(tiled_coords)
+    k = min(4, len(tiled_coords))
+    distances, nearest = tree.query(
+        empty_coords, k=k, distance_upper_bound=radius_px
+    )
+    if distances.ndim == 1:
+        distances = distances[:, None]
+        nearest = nearest[:, None]
+
+    fillable = np.isfinite(distances).any(axis=1)
+    if not np.any(fillable):
+        return atlas
+
+    dst = empty_coords[fillable]
+    nn_idx = nearest[fillable]
+    nn_dist = distances[fillable]
+    weights = 1.0 / np.clip(nn_dist, 1e-3, None)
+    weights[~np.isfinite(nn_dist)] = 0.0
+
+    safe_idx = np.clip(nn_idx, 0, len(tiled_colors) - 1)
+    samples = tiled_colors[safe_idx]
+    blended = (
+        (samples * weights[:, :, None]).sum(axis=1)
+        / np.clip(weights.sum(axis=1, keepdims=True), 1e-6, None)
+    )
+    atlas[dst[:, 0], dst[:, 1]] = np.clip(blended, 0, 255).astype(np.uint8)
+    return atlas
+
+
+def choose_candidate_cameras(tree_center: np.ndarray, cameras: list[Camera],
+                             max_cameras: int) -> list[Camera]:
+    ordered = sorted(cameras, key=lambda camera: float(np.linalg.norm(camera.center - tree_center)))
+    return ordered[:max_cameras]
+
+
+def blend_point_colors_from_cameras(points: np.ndarray, normals: np.ndarray,
+                                    cameras: list[Camera], max_views_per_point: int,
+                                    min_normal_dot: float) -> tuple[np.ndarray, np.ndarray, set[str]]:
+    """Blend camera colors onto observed 3D points, vectorized camera-by-camera."""
+    n = len(points)
+    accum = np.zeros((n, 3), dtype=np.float64)
+    total_w = np.zeros(n, dtype=np.float64)
+    view_count = np.zeros(n, dtype=np.uint16)
+    used_camera_names: set[str] = set()
+
+    for camera in cameras:
+        active = view_count < max_views_per_point
+        if not np.any(active):
+            break
+
+        active_idx = np.flatnonzero(active)
+        active_points = points[active_idx]
+        active_normals = normals[active_idx]
+
+        view_vec = camera.center[None, :] - active_points
+        dist = np.linalg.norm(view_vec, axis=1)
+        good_dist = dist > 1e-6
+        view_dir = view_vec / np.clip(dist[:, None], 1e-6, None)
+        dot = np.einsum("ij,ij->i", active_normals, view_dir)
+        facing = good_dist & (dot >= min_normal_dot)
+        if not np.any(facing):
+            continue
+
+        facing_idx = active_idx[facing]
+        xy, projected = project_world_points(camera, points[facing_idx])
+        if not np.any(projected):
+            continue
+
+        sample_idx = facing_idx[projected]
+        sample_xy = xy[projected]
+
         with Image.open(camera.path) as image:
-            pixels = torch.from_numpy(np.asarray(image.convert("RGB"), dtype=np.uint8).copy())
-        cache[camera.name] = pixels.permute(2, 0, 1).float().div_(255).unsqueeze(0).to(device)
-    return cache[camera.name]
+            image_array = np.asarray(image.convert("RGB"), dtype=np.float32)
+        rgb = bilinear_sample_many(image_array, sample_xy)
+
+        sample_view = camera.center[None, :] - points[sample_idx]
+        sample_dist = np.linalg.norm(sample_view, axis=1)
+        sample_dir = sample_view / np.clip(sample_dist[:, None], 1e-6, None)
+        sample_dot = np.einsum("ij,ij->i", normals[sample_idx], sample_dir)
+        weight = sample_dot / np.clip(sample_dist, 1e-3, None)
+
+        accum[sample_idx] += rgb * weight[:, None]
+        total_w[sample_idx] += weight
+        view_count[sample_idx] += 1
+        used_camera_names.add(camera.name)
+
+    used = total_w > 1e-8
+    if not np.any(used):
+        raise RuntimeError("No valid camera projections for this tree")
+
+    colors = np.zeros((n, 3), dtype=np.float32)
+    colors[used] = (accum[used] / total_w[used, None]).astype(np.float32)
+    return colors, used, used_camera_names
 
 
-def rasterize_atlas(vertices: np.ndarray, faces: np.ndarray, uv: np.ndarray,
-                    cameras: list[Camera], size: int, depth_tolerance: float,
-                    views_per_face: int, device_name: str) -> tuple[Image.Image, Image.Image, float, int]:
-    if device_name.startswith("cuda") and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but is not available")
-    device = torch.device(device_name)
-    vertex_tensor = torch.as_tensor(vertices, dtype=torch.float32, device=device)
-    poses, intrinsics = _camera_tensors(cameras, device)
-    atlas = np.zeros((size, size, 3), dtype=np.uint8)
-    mask = np.zeros((size, size), dtype=np.uint8)
-    source_images: set[str] = set()
-    gpu_images: dict[str, torch.Tensor] = {}
-    centers = torch.as_tensor(vertices[faces].mean(axis=1), dtype=torch.float32, device=device)
-    center_pixels, center_depths = _project_fisheye(centers, poses, intrinsics)
-    image_bounds = torch.tensor(
-        [[camera.width, camera.height] for camera in cameras],
-        dtype=torch.float32, device=device)
-    valid_centers = ((center_depths > 0)
-                     & (center_pixels[:, :, 0] >= 0)
-                     & (center_pixels[:, :, 1] >= 0)
-                     & (center_pixels[:, :, 0] < image_bounds[:, None, 0])
-                     & (center_pixels[:, :, 1] < image_bounds[:, None, 1]))
-    center_scores = torch.where(valid_centers, center_depths,
-                                torch.full_like(center_depths, float("inf")))
-    candidate_count = min(max(1, views_per_face), len(cameras))
-    candidate_scores, candidate_ids = torch.topk(
-        center_scores, candidate_count, largest=False, dim=0)
-    candidate_ids = candidate_ids.T.cpu().numpy()
-    candidate_ids[np.isinf(candidate_scores.T.cpu().numpy())] = -1
+def rasterize_point_atlas(uv: np.ndarray, rgb: np.ndarray, valid: np.ndarray,
+                          size: int, inpaint_radius_px: int) -> tuple[Image.Image, Image.Image, float]:
+    uv = uv[valid]
+    rgb = rgb[valid]
+    if len(uv) == 0:
+        raise RuntimeError("No valid point colors available for atlas rasterization")
 
-    atlas_indices = []
-    world_points_all = []
-    candidates_all = []
-    for face_index, face in enumerate(faces):
-        face_vertices = vertices[face]
-        # Unwrap each face independently so the cylindrical seam cannot stretch it.
-        face_uv = unwrap_face_u(uv[face])
-        triangle = face_uv * (size - 1)
-        minimum = np.maximum(np.floor(triangle.min(axis=0)).astype(int), 0)
-        maximum = np.minimum(np.ceil(triangle.max(axis=0)).astype(int), size - 1)
-        if np.any(minimum > maximum):
+    # Horizontal coordinate is periodic. The -0.5 aligns samples with texel
+    # centers used by render_cylinder_atlas_from_cameras.
+    u = (uv[:, 0] % 1.0) * size - 0.5
+    v = np.clip(uv[:, 1], 0.0, 1.0) * (size - 1)
+
+    x0 = np.floor(u).astype(np.int32)
+    y0 = np.floor(v).astype(np.int32)
+    x1 = x0 + 1
+    y1 = np.minimum(y0 + 1, size - 1)
+    wx = u - x0
+    wy = v - y0
+
+    accum = np.zeros((size * size, 3), dtype=np.float64)
+    weight = np.zeros(size * size, dtype=np.float64)
+
+    def splat(px: np.ndarray, py: np.ndarray, w: np.ndarray) -> None:
+        px = px % size
+        py = np.clip(py, 0, size - 1)
+        flat = py * size + px
+        np.add.at(weight, flat, w)
+        np.add.at(accum[:, 0], flat, rgb[:, 0] * w)
+        np.add.at(accum[:, 1], flat, rgb[:, 1] * w)
+        np.add.at(accum[:, 2], flat, rgb[:, 2] * w)
+
+    splat(x0, y0, (1 - wx) * (1 - wy))
+    splat(x1, y0, wx * (1 - wy))
+    splat(x0, y1, (1 - wx) * wy)
+    splat(x1, y1, wx * wy)
+
+    atlas = np.zeros((size * size, 3), dtype=np.uint8)
+    observed_flat = weight > 1e-8
+    atlas[observed_flat] = np.clip(
+        accum[observed_flat] / weight[observed_flat, None], 0, 255
+    ).astype(np.uint8)
+
+    atlas = atlas.reshape(size, size, 3)
+    observed = observed_flat.reshape(size, size)
+    atlas = inpaint_atlas_periodic(atlas, observed, inpaint_radius_px)
+
+    mask = (observed.astype(np.uint8) * 255)
+    coverage = float(observed.mean())
+    return Image.fromarray(atlas), Image.fromarray(mask), coverage
+
+
+def render_cylinder_atlas_from_cameras(model: CylinderModel, cameras: list[Camera],
+                                       size: int, max_views_per_texel: int,
+                                       min_normal_dot: float,
+                                       inpaint_radius_px: int) -> tuple[Image.Image, Image.Image, float, set[str]]:
+    """Render the analytic cylinder into the source images and blend texel colors.
+
+    The expensive dimension (all texels) is vectorized; Python only loops over
+    candidate cameras.
+    """
+    u = (np.arange(size, dtype=np.float32) + 0.5) / size
+    v = (np.arange(size, dtype=np.float32) + 0.5) / size
+    uu, vv = np.meshgrid(u, v)
+
+    theta = 2.0 * np.pi * ((uu + model.seam_offset) - 0.5)
+    t = model.t_min + vv * (model.t_max - model.t_min)
+
+    circle = (
+        np.cos(theta)[..., None] * model.e1[None, None, :]
+        + np.sin(theta)[..., None] * model.e2[None, None, :]
+    )
+    points = (
+        model.center[None, None, :]
+        + t[..., None] * model.axis[None, None, :]
+        + model.radius * circle
+    )
+
+    flat_points = points.reshape(-1, 3).astype(np.float32, copy=False)
+    flat_normals = circle.reshape(-1, 3).astype(np.float32, copy=False)
+
+    n = len(flat_points)
+    accum = np.zeros((n, 3), dtype=np.float64)
+    total_w = np.zeros(n, dtype=np.float64)
+    view_count = np.zeros(n, dtype=np.uint16)
+    used_camera_names: set[str] = set()
+
+    # VERY PRACTICAL DEBUGGING TEST
+    p = points.reshape(-1, 3)
+    print("CYLINDER:")
+    print("min   ", p.min(axis=0))
+    print("max   ", p.max(axis=0))
+    print("center", p.mean(axis=0))
+
+    centers = np.stack([c.center for c in cameras])
+    print("\nCOLMAP CAMERA CENTERS:")
+    print("min   ", centers.min(axis=0))
+    print("max   ", centers.max(axis=0))
+    print("mean  ", centers.mean(axis=0))
+
+    for camera in cameras:
+        active = view_count < max_views_per_texel
+        if not np.any(active):
+            break
+
+        active_idx = np.flatnonzero(active)
+        active_points = flat_points[active_idx]
+        active_normals = flat_normals[active_idx]
+
+        view_vec = camera.center[None, :] - active_points
+        dist = np.linalg.norm(view_vec, axis=1)
+        view_dir = view_vec / np.clip(dist[:, None], 1e-6, None)
+        dot = np.einsum("ij,ij->i", active_normals, view_dir)
+        facing = (dist > 1e-6) & (dot >= min_normal_dot)
+        if not np.any(facing):
             continue
-        xs, ys = np.meshgrid(
-            np.arange(minimum[0], maximum[0] + 1),
-            np.arange(minimum[1], maximum[1] + 1))
-        sample_uv = np.column_stack((xs.ravel(), ys.ravel())).astype(np.float32)
-        a, b, c = triangle
-        denominator = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
-        if abs(denominator) < 1e-8:
+
+        facing_idx = active_idx[facing]
+        xy, projected = project_world_points(camera, flat_points[facing_idx])
+        if not np.any(projected):
             continue
-        wa = ((b[1] - c[1]) * (sample_uv[:, 0] - c[0]) + (c[0] - b[0]) * (sample_uv[:, 1] - c[1])) / denominator
-        wb = ((c[1] - a[1]) * (sample_uv[:, 0] - c[0]) + (a[0] - c[0]) * (sample_uv[:, 1] - c[1])) / denominator
-        inside = (wa >= 0) & (wb >= 0) & (wa + wb <= 1)
-        if not np.any(inside):
-            continue
-        sample_uv, wa, wb = sample_uv[inside], wa[inside], wb[inside]
-        world_points = (wa[:, None] * face_vertices[0] + wb[:, None] * face_vertices[1]
-                        + (1 - wa - wb)[:, None] * face_vertices[2])
-        atlas_indices.append(sample_uv.astype(np.int64))
-        world_points_all.append(world_points)
-        candidates_all.append(np.broadcast_to(candidate_ids[face_index],
-                                               (len(world_points), candidate_count)))
-    if world_points_all:
-        world_points = torch.as_tensor(np.concatenate(world_points_all), dtype=torch.float32, device=device)
-        sample_indices = np.concatenate(atlas_indices)
-        candidates = torch.as_tensor(np.concatenate(candidates_all), dtype=torch.long, device=device)
-        blended = torch.zeros((len(world_points), 3), device=device)
-        total_weight = torch.zeros(len(world_points), device=device)
-        for camera_index in torch.unique(candidates[candidates >= 0]).tolist():
-            selector = (candidates == camera_index).any(dim=1)
-            camera = cameras[camera_index]
-            pixels, depths = _project_fisheye(
-                world_points[selector], poses[camera_index:camera_index + 1],
-                intrinsics[camera_index:camera_index + 1])
-            pixels, depths = pixels[0], depths[0]
-            width, height = camera.width, camera.height
-            valid = ((depths > 0) & (pixels[:, 0] >= 0) & (pixels[:, 1] >= 0)
-                     & (pixels[:, 0] < width - 1) & (pixels[:, 1] < height - 1))
-            if not torch.any(valid):
-                continue
-            selected_indices = torch.where(selector)[0][valid]
-            grid = pixels[valid].clone()
-            grid[:, 0] = grid[:, 0] / (width - 1) * 2 - 1
-            grid[:, 1] = grid[:, 1] / (height - 1) * 2 - 1
-            sampled = F.grid_sample(
-                _load_gpu_image(camera, gpu_images, device), grid[None, :, None, :],
-                mode="bilinear", padding_mode="border", align_corners=True)[0, :, :, 0].T
-            weight = 1.0 / depths[valid].clamp_min(1e-3)
-            blended[selected_indices] += sampled * weight[:, None]
-            total_weight[selected_indices] += weight
-            source_images.add(camera.name)
-        valid = total_weight > 0
-        rgb = (blended[valid] / total_weight[valid, None] * 255).byte().cpu().numpy()
-        pixel_indices = sample_indices[valid.cpu().numpy()]
-        pixel_indices[:, 0] %= size
-        write_y, write_x = pixel_indices[:, 1], pixel_indices[:, 0]
-        unwritten = mask[write_y, write_x] == 0
-        atlas[write_y[unwritten], write_x[unwritten]] = rgb[unwritten]
-        mask[write_y[unwritten], write_x[unwritten]] = 255
-    coverage = float(np.count_nonzero(mask)) / float(size * size)
-    return Image.fromarray(atlas), Image.fromarray(mask), coverage, len(source_images)
+
+        sample_idx = facing_idx[projected]
+        sample_xy = xy[projected]
+
+        with Image.open(camera.path) as image:
+            image_array = np.asarray(image.convert("RGB"), dtype=np.float32)
+        rgb = bilinear_sample_many(image_array, sample_xy)
+
+        sample_view = camera.center[None, :] - flat_points[sample_idx]
+        sample_dist = np.linalg.norm(sample_view, axis=1)
+        sample_dir = sample_view / np.clip(sample_dist[:, None], 1e-6, None)
+        sample_dot = np.einsum("ij,ij->i", flat_normals[sample_idx], sample_dir)
+        weight = sample_dot / np.clip(sample_dist, 1e-3, None)
+
+        accum[sample_idx] += rgb * weight[:, None]
+        total_w[sample_idx] += weight
+        view_count[sample_idx] += 1
+        used_camera_names.add(camera.name)
+
+    observed = total_w > 1e-8
+    if not np.any(observed):
+        raise RuntimeError("No valid camera projections for this cylinder")
+
+    atlas_img = np.zeros((n, 3), dtype=np.uint8)
+    atlas_img[observed] = np.clip(
+        accum[observed] / total_w[observed, None], 0, 255
+    ).astype(np.uint8)
+    atlas_img = atlas_img.reshape(size, size, 3)
+
+    observed_2d = observed.reshape(size, size)
+    atlas_img = inpaint_atlas_periodic(
+        atlas_img, observed_2d, inpaint_radius_px
+    )
+    mask_img = observed_2d.astype(np.uint8) * 255
+
+    coverage = float(observed.mean())
+    return (
+        Image.fromarray(atlas_img),
+        Image.fromarray(mask_img),
+        coverage,
+        used_camera_names,
+    )
+
+
+def build_cylinder_mesh(model: CylinderModel, sides: int, rings: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    vertices = []
+    uvs = []
+    for ring in range(rings + 1):
+        v = ring / max(rings, 1)
+        t = model.t_min + v * (model.t_max - model.t_min)
+        axis_point = model.center + t * model.axis
+        for side in range(sides + 1):
+            u = side / max(sides, 1)
+            theta = 2.0 * np.pi * ((u + model.seam_offset) - 0.5)
+            circle = model.radius * (np.cos(theta) * model.e1 + np.sin(theta) * model.e2)
+            vertices.append(axis_point + circle)
+            uvs.append([u, v])
+
+    vertices = np.asarray(vertices, dtype=np.float32)
+    uvs = np.asarray(uvs, dtype=np.float32)
+
+    faces = []
+    stride = sides + 1
+    for ring in range(rings):
+        row0 = ring * stride
+        row1 = (ring + 1) * stride
+        for side in range(sides):
+            a = row0 + side
+            b = row0 + side + 1
+            c = row1 + side
+            d = row1 + side + 1
+            faces.append([a, c, b])
+            faces.append([b, c, d])
+
+    return vertices, np.asarray(faces, dtype=np.int32), uvs
 
 
 def write_mesh(path: Path, vertices: np.ndarray, faces: np.ndarray,
@@ -372,73 +683,209 @@ def write_mesh(path: Path, vertices: np.ndarray, faces: np.ndarray,
     mesh.export(path, file_type="glb")
 
 
-def process_tree(tree_id: int, points: np.ndarray, cameras: list[Camera], args: argparse.Namespace,
-                 meshes_dir: Path, atlases_dir: Path, log: Callable[[str], None]) -> dict:
-    log(f"  Tree {tree_id}: reconstructing mesh from {len(points):,} cropped points")
-    vertices, faces = build_mesh(points, args.voxel_size, args.poisson_depth, args.target_triangles)
-    log(f"  Tree {tree_id}: mesh has {len(vertices):,} vertices and {len(faces):,} triangles")
-    uv = cylindrical_uv(vertices, args.vertical_axis)
-    log(f"  Tree {tree_id}: projecting visible image texture into {args.atlas_size}x{args.atlas_size} atlas")
-    try:
-        atlas, mask, coverage, observations = rasterize_atlas(
-            vertices, faces, uv, cameras, args.atlas_size, args.depth_tolerance,
-            args.views_per_face, args.device)
-        stem = f"tree_{tree_id:06d}"
-        mesh_path = meshes_dir / f"{stem}.glb"
-        atlas_path = atlases_dir / f"{stem}.png"
-        mask_path = atlases_dir / f"{stem}_mask.png"
-        atlas.save(atlas_path)
-        mask.save(mask_path)
-        write_mesh(mesh_path, vertices, faces, uv, atlas)
-        log(f"  Tree {tree_id}: coverage {coverage:.1%}, {observations} source images, wrote {stem}.glb")
-        return {
-            "tree_id": tree_id,
-            "mesh": str(mesh_path),
-            "atlas": str(atlas_path),
-            "mask": str(mask_path),
-            "center": points.mean(axis=0).round(6).tolist(),
-            "bounds": {"min": points.min(axis=0).round(6).tolist(), "max": points.max(axis=0).round(6).tolist()},
-            "point_count": int(len(points)),
-            "mesh_face_count": int(len(faces)),
-            "texture_coverage": coverage,
-            "source_image_count": observations,
-            "quality_flags": [] if coverage > 0.01 else ["low_texture_coverage"],
-        }
-    finally:
-        # Release references and cached blocks before the next large tree.
-        gc.collect()
-        if args.device.startswith("cuda") and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+def process_tree(tree_id: int, tree_data: TreeData,
+                 cameras: list[Camera], args: argparse.Namespace,
+                 meshes_dir: Path, atlases_dir: Path,
+                 log: Callable[[str], None]) -> dict:
+    points = tree_data.points
+    log(f"  Tree {tree_id}: fitting tilted cylinder to {len(points):,} points")
+    cylinder = fit_cylinder(points, args.vertical_axis)
+
+    tree_center = points.mean(axis=0)
+    candidates = choose_candidate_cameras(
+        tree_center, cameras, args.max_cameras_per_tree
+    )
+
+    # DEBUG: project red points onto images and save them
+    camera = candidates[0]
+
+    img = np.asarray(
+        Image.open(camera.path).convert("RGB")
+    ).copy()
+
+    sample_points = points[::20]
+
+    projected = 0
+
+    for point in sample_points:
+        uv = camera.colmap_image.project_point(point.astype(np.float64))
+        if uv is None:
+            continue
+
+        x = int(round(float(uv[0])))
+        y = int(round(float(uv[1])))
+
+        if 0 <= x < img.shape[1] and 0 <= y < img.shape[0]:
+            r = 3
+            img[
+                max(0, y-r):min(img.shape[0], y+r+1),
+                max(0, x-r):min(img.shape[1], x+r+1)
+            ] = [255, 0, 0]
+
+            projected += 1
+
+    Image.fromarray(img).save(
+        args.output / f"debug_projection_tree_{tree_id}.jpg"
+    )
+
+    print(
+        f"Projected {projected}/{len(sample_points)} "
+        f"TreeLearn points into {camera.name}"
+    )
+    # DEBUG ENDS
+
+    if args.texture_source == "camera_cylinder":
+        log(
+            f"  Tree {tree_id}: projecting cylinder texels from "
+            f"{len(candidates)} nearest cameras"
+        )
+        atlas, mask, coverage, used_cameras = render_cylinder_atlas_from_cameras(
+            cylinder,
+            candidates,
+            args.atlas_size,
+            args.max_views_per_point,
+            args.min_normal_dot,
+            args.inpaint_radius_px,
+        )
+        texture_points_used = args.atlas_size * args.atlas_size
+
+    else:
+        uv, radial = points_to_cylinder_uv(points, cylinder)
+        normals = radial / np.clip(
+            np.linalg.norm(radial, axis=1, keepdims=True), 1e-6, None
+        )
+
+        if len(points) > args.max_texture_points:
+            rng = np.random.default_rng(tree_id)
+            indices = rng.choice(
+                len(points), size=args.max_texture_points, replace=False
+            )
+        else:
+            indices = np.arange(len(points))
+
+        texture_points = points[indices]
+        texture_uv = uv[indices]
+        texture_normals = normals[indices]
+
+        if args.texture_source == "point_rgb":
+            if tree_data.colors16 is None:
+                raise RuntimeError(
+                    "texture-source=point_rgb requested, but the LAS/LAZ has no RGB fields"
+                )
+            point_rgb8 = point_rgb_to_uint8(tree_data.colors16[indices])
+            used_mask = np.ones(len(indices), dtype=bool)
+            used_cameras: set[str] = set()
+            log(
+                f"  Tree {tree_id}: rasterizing {len(indices):,} LAS RGB point samples"
+            )
+        else:
+            log(
+                f"  Tree {tree_id}: projecting {len(indices):,} point samples "
+                f"from {len(candidates)} nearest cameras"
+            )
+            try:
+                point_rgb8, used_mask, used_cameras = blend_point_colors_from_cameras(
+                    texture_points,
+                    texture_normals,
+                    candidates,
+                    args.max_views_per_point,
+                    args.min_normal_dot,
+                )
+            except RuntimeError:
+                if tree_data.colors16 is None:
+                    raise
+                log(
+                    f"  Tree {tree_id}: no valid camera projections; "
+                    "falling back to LAS RGB"
+                )
+                point_rgb8 = point_rgb_to_uint8(tree_data.colors16[indices])
+                used_mask = np.ones(len(indices), dtype=bool)
+                used_cameras = set()
+
+        atlas, mask, coverage = rasterize_point_atlas(
+            texture_uv,
+            point_rgb8,
+            used_mask,
+            args.atlas_size,
+            args.inpaint_radius_px,
+        )
+        texture_points_used = len(indices)
+
+    mesh_vertices, mesh_faces, mesh_uv = build_cylinder_mesh(
+        cylinder, args.cylinder_sides, args.cylinder_rings)
+
+    stem = f"tree_{tree_id:06d}"
+    mesh_path = meshes_dir / f"{stem}.glb"
+    atlas_path = atlases_dir / f"{stem}.png"
+    mask_path = atlases_dir / f"{stem}_mask.png"
+
+    atlas.save(atlas_path)
+    mask.save(mask_path)
+    write_mesh(mesh_path, mesh_vertices, mesh_faces, mesh_uv, atlas)
+
+    log(
+        f"  Tree {tree_id}: coverage {coverage:.1%}, "
+        f"{len(used_cameras)} source images, radius={cylinder.radius:.3f} m")
+
+    return {
+        "tree_id": tree_id,
+        "mesh": str(mesh_path),
+        "atlas": str(atlas_path),
+        "mask": str(mask_path),
+        "center": points.mean(axis=0).round(6).tolist(),
+        "axis": cylinder.axis.round(6).tolist(),
+        "radius": float(cylinder.radius),
+        "t_range": [float(cylinder.t_min), float(cylinder.t_max)],
+        "point_count": int(len(points)),
+        "texture_points": int(texture_points_used),
+        "mesh_face_count": int(len(mesh_faces)),
+        "texture_coverage": coverage,
+        "source_image_count": int(len(used_cameras)),
+        "quality_flags": [] if coverage > 0.1 else ["low_texture_coverage"],
+    }
 
 
 def main() -> None:
     args = parse_args()
     log = make_logger(args.quiet)
+
     output = args.output
     meshes_dir, atlases_dir = output / "meshes", output / "atlases"
     meshes_dir.mkdir(parents=True, exist_ok=True)
     atlases_dir.mkdir(parents=True, exist_ok=True)
-    log("=== Create textured trunk atlases ===")
+
+    log("=== Create cylinder trunk atlases ===")
     log(f"Output directory: {output}")
-    log(f"Settings: height={args.height:g}, voxel_size={args.voxel_size:g}, "
-        f"poisson_depth={args.poisson_depth}, target_triangles={args.target_triangles}, "
-        f"atlas_size={args.atlas_size}, views_per_face={args.views_per_face}, device={args.device}")
+    log(
+        f"Settings: height={args.height:g}, atlas_size={args.atlas_size}, "
+        f"texture_source={args.texture_source}, max_cameras_per_tree={args.max_cameras_per_tree}")
+
+    trees = load_tree_points(
+        args.segmented_cloud, args.vertical_axis, args.height, args.min_points, log,
+        args.trunk_slice_height, args.trunk_radius_quantile, args.trunk_radius_scale)
+
     cameras = load_cameras(args.colmap_model, args.images, log)
-    trees = load_tree_points(args.segmented_cloud, args.vertical_axis, args.height, args.min_points, log)
+
     tree_items = sorted(trees.items())[:args.max_trees] if args.max_trees else sorted(trees.items())
     if args.max_trees:
         log(f"Processing pilot subset: {len(tree_items)} of {len(trees)} trees")
     else:
         log(f"Processing all {len(tree_items)} retained trees")
+
     records = []
-    for index, (tree_id, points) in enumerate(tree_items, 1):
-        log(f"[{index}/{len(tree_items)}] treeID={tree_id}, points={len(points):,}")
+    for index, (tree_id, tree_data) in enumerate(tree_items, 1):
+        log(f"[{index}/{len(tree_items)}] treeID={tree_id}, points={len(tree_data.points):,}")
         try:
-            records.append(process_tree(tree_id, points, cameras, args, meshes_dir, atlases_dir, log))
-        except Exception as error:
+            records.append(process_tree(
+                tree_id, tree_data,
+                cameras, args, meshes_dir, atlases_dir, log))
+        except Exception as error:  # noqa: BLE001
             print(f"  Tree {tree_id}: skipped: {error}", file=sys.stderr)
+        finally:
+            gc.collect()
+
     manifest = {
-        "coordinate_system": "COLMAP reconstruction coordinates; Z is vertical",
+        "coordinate_system": f"COLMAP reconstruction coordinates; axis {args.vertical_axis} treated as vertical",
         "source_cloud": str(args.segmented_cloud),
         "colmap_model": str(args.colmap_model),
         "image_root": str(args.images),
@@ -448,8 +895,10 @@ def main() -> None:
         },
         "trees": records,
     }
+
     with (output / "atlas_manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2)
+
     log(f"Wrote {len(records)} textured trees to {output}")
     if len(records) != len(tree_items):
         log(f"Skipped {len(tree_items) - len(records)} trees; see messages above")
